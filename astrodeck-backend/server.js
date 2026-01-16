@@ -1,8 +1,10 @@
-// server.js
+// astrodeck-backend/server.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const path = require('path');
+const fs = require('fs');
 
 const authRoutes = require('./authRoutes');
 const subscriptionRoutes = require('./subscriptionRoutes');
@@ -29,9 +31,7 @@ const TAROTAPI_BASE_URL = 'https://tarotapi.dev/api/v1';
 
 // ===== MIDDLEWARES =====
 
-// servir arquivos estáticos (imagens, etc.) – pasta "public"
-app.use('/static', express.static('public'));
-
+// CORS restrito por lista (CORS_ORIGIN="http://localhost:8080,https://seudominio.com")
 const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:8080')
   .split(',')
   .map((s) => s.trim())
@@ -58,15 +58,24 @@ app.use('/api/auth', authRoutes);
 
 // Rotas de assinatura / premium (ativação manual por X dias, etc.)
 app.use('/api/subscriptions', subscriptionRoutes);
+
 app.use('/api/payments', paymentsRoutes);
+
 app.use('/api/push', pushRoutes);
 
+// Arquivos estáticos
+app.use('/static', express.static('public'));
 
 // ===== ROTAS =====
 
-// Healthcheck simples
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true });
+});
+
 app.get('/', (req, res) => {
-  res.send('Backend ASTRODECK rodando com tarotapi.dev + n8n + Supabase 🔮');
+  const webIndex = path.join(__dirname, 'public_web', 'index.html');
+  if (fs.existsSync(webIndex)) return res.sendFile(webIndex);
+  return res.send('Backend ASTRODECK rodando com tarotapi.dev + n8n + Supabase 🔮');
 });
 
 /**
@@ -88,40 +97,65 @@ app.get('/', (req, res) => {
  * OBS: o status premium e as moedas NÃO são confiados vindo do app.
  * Sempre buscamos e normalizamos no Supabase via getUserWithNormalizedPremium.
  */
-app.post('/api/tarot-reading', async (req, res) => {
+app.post('/api/reading', async (req, res) => {
+  const { topic, userId } = req.body;
+
+  if (!topic || !userId) {
+    return res.status(400).json({ error: 'topic e userId são obrigatórios.' });
+  }
+
+  // 1) Buscar e normalizar dados do usuário (premium + coins)
+  let safeIsPremium = false;
+  let userCoins = 0;
+
   try {
-    const { topic, userId } = req.body;
+    const userData = await getUserWithNormalizedPremium(userId);
 
-    // topic agora é texto livre, mas validamos se não veio vazio
-    if (!topic || typeof topic !== 'string' || topic.trim().length < 3) {
-      return res.status(400).json({
-        error: 'topic deve ser um texto com pelo menos 3 caracteres',
-      });
+    if (!userData) {
+      return res.status(404).json({ error: 'Usuário não encontrado.' });
     }
 
-    if (!userId) {
-      return res.status(400).json({ error: 'userId é obrigatório' });
+    safeIsPremium = !!userData.isPremium;
+    userCoins = userData.coins || 0;
+  } catch (err) {
+    console.error('Erro ao buscar usuário:', err?.message || err);
+    return res.status(500).json({ error: 'Erro ao buscar dados do usuário.' });
+  }
+
+  // 2) Se não for premium e não tiver moedas, bloqueia
+  if (!safeIsPremium && userCoins <= 0) {
+    return res.status(403).json({
+      error: 'Você não tem moedas suficientes para fazer uma nova leitura.',
+      code: 'NO_COINS',
+      isPremium: safeIsPremium,
+      coins: userCoins,
+    });
+  }
+
+  // 3) Se não for premium e tem moedas, consumir 1 moeda
+  if (!safeIsPremium && userCoins > 0) {
+    try {
+      const { data: updated, error } = await supabase
+        .from('users')
+        .update({ coins: userCoins - 1 })
+        .eq('id', userId)
+        .select()
+        .single();
+
+      if (error) {
+        console.error('Erro ao atualizar moedas:', error);
+        return res.status(500).json({ error: 'Erro ao consumir moeda.' });
+      }
+
+      userCoins = updated.coins || 0;
+    } catch (err) {
+      console.error('Erro ao consumir moeda:', err?.message || err);
+      return res.status(500).json({ error: 'Erro ao consumir moeda.' });
     }
+  }
 
-    const normalizedTopic = topic.trim();
-
-    // pega o usuário no Supabase e normaliza premium + moedas (regra diária)
-    const user = await getUserWithNormalizedPremium(userId);
-    const safeIsPremium = !!user.is_premium;
-    let userCoins = user.coins ?? 0;
-
-    // Sem moedas suficientes para tirar carta
-    if (userCoins <= 0) {
-      return res.status(403).json({
-        error: 'NO_COINS',
-        message:
-          'Você não possui moedas suficientes para uma nova tiragem hoje.',
-        isPremium: safeIsPremium,
-        coins: userCoins,
-      });
-    }
-
-    // 1) Sorteia cartas na tarotapi.dev
+  // 4) Sorteio das cartas via tarotapi.dev
+  try {
     const url = `${TAROTAPI_BASE_URL}/cards/random`;
     const n = 3; // quantidade de cartas na tiragem
 
@@ -139,50 +173,48 @@ app.post('/api/tarot-reading', async (req, res) => {
     // 2) Adiciona name_pt nas cartas usando o módulo de linguagem
     allCards = allCards.map((card) => ({
       ...card,
-      name_pt: translateCardName(card),
+      name_pt: translateCardName(card.name),
     }));
 
-    const primaryCard = allCards[0];
-
-    // 3) Monta payload para o n8n
-    const payloadForN8n = {
-      topic: normalizedTopic, // texto livre
-      userId, // id do usuário (uuid do Supabase)
-      isPremium: safeIsPremium, // status da assinatura vindo do banco
-      primaryCard, // carta principal já com name_pt
-      cards: allCards,
-      source: 'astrodeck-backend',
-    };
-
-    // Valores padrão (caso n8n falhe)
-    let resultTopic = normalizedTopic;
-    let resultIsPremium = safeIsPremium;
-    let resultDesc = null;
-
-    // cartões padrão (free: só uma carta)
-    let resultCards = [
-      {
-        name_pt: primaryCard.name_pt || primaryCard.name,
-        file_name: `${primaryCard.name_short}.png`,
-      },
-    ];
-
-    // pegar protocol e host da requisição (para montar URLs)
-    const protocol = req.protocol; // 'http'
-    const host = req.get('host'); // ex: '10.0.2.2:3000' ou '192.168.0.15:3000'
-
-    // base das imagens (env ou host atual)
+    // 3) Descobre base URL (CARD_IMAGE_BASE_URL ou fallback pro próprio servidor)
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.get('host');
     const cardImageBaseUrl =
       CARD_IMAGE_BASE_URL || `${protocol}://${host}/static/tarot`;
 
-    // helper local pra garantir .png
-    const ensurePng = (raw, fallback) => {
-      const base = raw || fallback;
-      if (!base) return null;
-      return base.endsWith('.png') ? base : `${base}.png`;
+    const ensurePng = (nameShort, fallback) => {
+      if (!nameShort) return fallback;
+      const cleaned = String(nameShort).trim();
+      if (!cleaned) return fallback;
+      return cleaned.endsWith('.png') ? cleaned : `${cleaned}.png`;
     };
 
-    // 4) Envia para n8n e lê resposta
+    // 4) Monta payload para n8n
+    const payloadForN8n = {
+      topic,
+      userId,
+      isPremium: safeIsPremium,
+      coins: userCoins,
+      cards: allCards,
+      card_image_base_url: cardImageBaseUrl,
+      public_base_url: PUBLIC_BASE_URL,
+    };
+
+    // 5) Resposta padrão (caso n8n não esteja configurado)
+    let resultTopic = topic;
+    let resultCards = allCards.map((c) => {
+      const fileName = ensurePng(c.name_short, null);
+      const imageUrl = fileName ? `${cardImageBaseUrl}/${fileName}` : null;
+
+      return {
+        name_pt: c.name_pt || '',
+        file_name: fileName,
+        image_url: imageUrl,
+      };
+    });
+    let resultDesc = '';
+
+    // 6) Envia para n8n (se configurado) e monta resposta final
     if (N8N_WEBHOOK_URL) {
       try {
         const n8nResp = await axios.post(N8N_WEBHOOK_URL, payloadForN8n);
@@ -191,18 +223,12 @@ app.post('/api/tarot-reading', async (req, res) => {
         const dataFromN8n = n8nResp.data;
         const item = Array.isArray(dataFromN8n) ? dataFromN8n[0] : dataFromN8n;
 
-        if (item.topic) {
-          // se o n8n quiser ajustar o tópico, deixamos
-          resultTopic = item.topic;
-        }
+        const body = item?.body || {};
 
-        const body = item.body || {};
-        if (typeof body.isPremium === 'boolean') {
-          resultIsPremium = body.isPremium;
-        } else {
-          // se o n8n não devolver nada sobre premium, usamos o do banco
-          resultIsPremium = safeIsPremium;
-        }
+        if (item.topic) resultTopic = item.topic;
+
+        if (typeof body.isPremium === 'boolean') safeIsPremium = body.isPremium;
+        if (typeof body.coins === 'number') userCoins = body.coins;
 
         // PREMIUM: body.cards (lista de cartas)
         if (Array.isArray(body.cards) && body.cards.length > 0) {
@@ -218,13 +244,16 @@ app.post('/api/tarot-reading', async (req, res) => {
               image_url: imageUrl,
             };
           });
-        } else if (body.primaryCard) {
-          // FREE (ou fallback): primaryCard
-          const c = body.primaryCard;
-          const fileName = ensurePng(c.name_short, primaryCard.name_short);
-          const imageUrl = fileName
-            ? `${cardImageBaseUrl}/${fileName}`
-            : null;
+        } else if (item.primaryCard) {
+          // FREE: primaryCard (uma carta)
+          const primaryCard = item.primaryCard;
+          const c = allCards[0] || primaryCard;
+
+          const fileName = ensurePng(
+            primaryCard.file_name || primaryCard.fileName,
+            null
+          );
+          const imageUrl = fileName ? `${cardImageBaseUrl}/${fileName}` : null;
 
           resultCards = [
             {
@@ -239,93 +268,58 @@ app.post('/api/tarot-reading', async (req, res) => {
           resultDesc = item.card_desc;
         }
       } catch (err) {
-        console.error(
-          'Erro ao enviar carta para n8n:',
-          err.response?.status,
-          err.response?.data || err.message
-        );
+        console.error('Erro ao enviar para n8n:', err?.response?.data || err.message);
+        // não falha o fluxo; devolve leitura sem n8n
       }
-    } else {
-      console.warn('N8N_WEBHOOK_URL não definido no .env');
     }
 
-    // 5) Para qualquer carta que ainda não tenha image_url (fallback), monta aqui
-    resultCards = resultCards.map((card) => {
-      if (!card.file_name) return card;
-      if (card.image_url) return card;
-
-      return {
-        ...card,
-        image_url: `${cardImageBaseUrl}/${card.file_name}`,
-      };
-    });
-
-    // 6) Desconta 1 moeda pela tiragem
-    let finalCoins = Math.max(userCoins - 1, 0);
-
-    try {
-      const { data: updatedUser, error: coinsError } = await supabase
-        .from('users')
-        .update({ coins: finalCoins })
-        .eq('id', userId)
-        .select()
-        .single();
-
-      if (!coinsError && updatedUser) {
-        finalCoins = updatedUser.coins ?? finalCoins;
-      }
-    } catch (e) {
-      console.error('Erro ao atualizar moedas após tiragem:', e.message);
-    }
-
-    // 7) Push: leitura pronta
-    try {
-      const payload = push.buildPayload({
-        title: 'Sua leitura está pronta 🔮',
-        body: 'Toque para ver o resultado no Astrodeck.',
-        url: '/',
-        tag: 'tarot-ready',
-      });
-
-      // Dedup por minuto (evita spam em replays rápidos)
-      const ref = `${String(userId)}:${new Date().toISOString().slice(0, 16)}`;
-      await push.sendToUser(userId, payload, { dedupeKind: 'tarot_ready', dedupeRef: ref });
-    } catch (e) {
-      logLine('tarot_ready_push_failed', { userId, message: e?.message || String(e) });
-    }
-
-    // 8) Resposta final para o app (front)
     return res.json({
-      topic: resultTopic, // texto livre (pergunta/tema)
-      isPremium: resultIsPremium,
-      userId,
+      topic: resultTopic,
       cards: resultCards,
-      description: resultDesc,
-      coins: finalCoins,
+      card_desc: resultDesc,
+      isPremium: safeIsPremium,
+      coins: userCoins,
     });
   } catch (err) {
     if (err.response) {
-      console.error(
-        'Erro na tarotapi.dev:',
-        err.response.status,
-        JSON.stringify(err.response.data, null, 2)
-      );
+      console.error('Erro tarotapi.dev:', err.response.status, err.response.data);
       return res.status(500).json({
-        error: 'Erro na tarotapi.dev',
+        error: 'Erro ao buscar cartas na API de tarot.',
         status: err.response.status,
         details: err.response.data,
       });
-    } else {
+    }
+
+    if (err.request) {
       console.error('Erro de rede/axios:', err.message);
       return res.status(500).json({
         error: 'Erro ao processar tiragem (rede ou axios).',
         details: err.message,
       });
     }
+
+    console.error('Erro inesperado:', err);
+    return res.status(500).json({
+      error: 'Erro inesperado ao processar tiragem.',
+      details: err.message,
+    });
   }
 });
 
-// Sobe o servidor
+
+// Em produção (Docker), servir o frontend buildado (Vite) se existir.
+// O build é copiado para ./public_web no container.
+const webDir = path.join(__dirname, 'public_web');
+const webIndex = path.join(webDir, 'index.html');
+if (fs.existsSync(webIndex)) {
+  app.use(express.static(webDir));
+
+  // SPA fallback
+  app.get(/.*/, (req, res, next) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/static')) return next();
+    return res.sendFile(webIndex);
+  });
+}
 
 // ===== PUSH CRON (opcional) =====
 // Envia alerta de expiração do Premium (ex: 3 dias antes).
