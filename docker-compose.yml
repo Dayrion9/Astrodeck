@@ -1,0 +1,24 @@
+# docker-compose.yml
+services:
+  backend:
+    build:
+      context: ./astrodeck-backend
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # Coloque no EasyPanel (Compose env):
+      # JWT_SECRET: "..."
+      # DUSTPAY_API_KEY: "..."
+      # DATABASE_URL: "..."
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./astrodeck-web
+      args:
+        VITE_API_BASE_URL: ""  # same-origin; usa "/api" direto
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

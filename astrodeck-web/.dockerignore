@@ -1,0 +1,6 @@
+# astrodeck-web/.dockerignore
+node_modules
+dist
+.env
+.env.*
+.git
